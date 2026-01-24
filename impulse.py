@@ -256,7 +256,7 @@ def _format_ml_features_multiline(symbol: str, features: dict, ordered_feature_n
 
     # metas después
     meta_keys = [
-        "p_long","p_thr_long","p_short","p_thr_short",
+        "p_long_raw","p_long","p_thr_long","p_short_raw","p_short","p_thr_short",
         "tp_k_atr5m","sl_m_atr5m",
         "trend_1m_long","trend_1m_short",
         "_status","_reason"
@@ -289,8 +289,10 @@ def _format_indicator_line(metrics_line: str, ml_features: dict, ordered_feature
 
     # metas
     parts += [
+        f"p_long_raw={_fmt6(ml_features.get('p_long_raw'))}",
         f"p_long={_fmt6(ml_features.get('p_long'))}",
         f"p_thr_long={_fmt6(ml_features.get('p_thr_long'))}",
+        f"p_short_raw={_fmt6(ml_features.get('p_short_raw'))}",
         f"p_short={_fmt6(ml_features.get('p_short'))}",
         f"p_thr_short={_fmt6(ml_features.get('p_thr_short'))}",
         f"tp_k_atr5m={_fmt6(ml_features.get('tp_k_atr5m'))}",
@@ -659,6 +661,10 @@ class TrendBot:
 
         self.model_long = self.packed_long.get("model") if isinstance(self.packed_long, dict) else None
         self.model_short = self.packed_short.get("model") if isinstance(self.packed_short, dict) else None
+        self.best_iteration_long = self.packed_long.get("best_iteration") if isinstance(self.packed_long, dict) else None
+        self.best_iteration_short = self.packed_short.get("best_iteration") if isinstance(self.packed_short, dict) else None
+        self.calibrator_long = self.packed_long.get("calibrator") if isinstance(self.packed_long, dict) else None
+        self.calibrator_short = self.packed_short.get("calibrator") if isinstance(self.packed_short, dict) else None
 
         # features desde pkl
         self.features_long = self.packed_long.get("features") if isinstance(self.packed_long, dict) else None
@@ -949,8 +955,10 @@ class TrendBot:
                 "trend_1m_short": float(trend_1m_short),
                 "_status": "not_ready",
                 "_reason": reason or "no especificado",
+                "p_long_raw": math.nan,
                 "p_long": math.nan,
                 "p_thr_long": float(P_TREND_LONG_THRESHOLD),
+                "p_short_raw": math.nan,
                 "p_short": math.nan,
                 "p_thr_short": float(P_TREND_SHORT_THRESHOLD),
                 "tp_k_atr5m": float(TP_K_ATR5M),
@@ -966,23 +974,47 @@ class TrendBot:
         # ---------
         # CORRECCIÓN: p_long y p_short SIEMPRE
         # ---------
+        p_long_raw = math.nan
+        p_short_raw = math.nan
         p_long = math.nan
         p_short = math.nan
         errors = []
 
         if self.model_long is not None:
             try:
-                p_long = float(self.model_long.predict_proba(x_df)[0][1])
+                p_long_raw = float(
+                    self.model_long.predict_proba(x_df, num_iteration=self.best_iteration_long)[0][1]
+                )
             except Exception as exc:
                 logger.exception("Error predict_proba trend long", exc_info=exc)
                 errors.append("predict_proba long")
 
         if self.model_short is not None:
             try:
-                p_short = float(self.model_short.predict_proba(x_df)[0][1])
+                p_short_raw = float(
+                    self.model_short.predict_proba(x_df, num_iteration=self.best_iteration_short)[0][1]
+                )
             except Exception as exc:
                 logger.exception("Error predict_proba trend short", exc_info=exc)
                 errors.append("predict_proba short")
+
+        if self.calibrator_long is not None and math.isfinite(p_long_raw):
+            try:
+                p_long = float(self.calibrator_long.predict(np.array([p_long_raw]))[0])
+            except Exception as exc:
+                logger.exception("Error calibrator trend long", exc_info=exc)
+                errors.append("calibrator long")
+        else:
+            p_long = p_long_raw
+
+        if self.calibrator_short is not None and math.isfinite(p_short_raw):
+            try:
+                p_short = float(self.calibrator_short.predict(np.array([p_short_raw]))[0])
+            except Exception as exc:
+                logger.exception("Error calibrator trend short", exc_info=exc)
+                errors.append("calibrator short")
+        else:
+            p_short = p_short_raw
 
         status = "ok" if not errors else "warn"
         reason2 = ", ".join(errors) if errors else ""
@@ -993,8 +1025,10 @@ class TrendBot:
             "trend_1m_short": float(trend_1m_short),
             "_status": status,
             "_reason": reason2,
+            "p_long_raw": float(p_long_raw) if math.isfinite(p_long_raw) else math.nan,
             "p_long": float(p_long) if math.isfinite(p_long) else math.nan,
             "p_thr_long": float(P_TREND_LONG_THRESHOLD),
+            "p_short_raw": float(p_short_raw) if math.isfinite(p_short_raw) else math.nan,
             "p_short": float(p_short) if math.isfinite(p_short) else math.nan,
             "p_thr_short": float(P_TREND_SHORT_THRESHOLD),
             "tp_k_atr5m": float(TP_K_ATR5M),
