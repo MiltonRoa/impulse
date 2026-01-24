@@ -746,6 +746,10 @@ class TrendBot:
         def _not_ready(reason: str):
             return None, reason
 
+        atr1m = self.atr_values_1m.get(sym)
+        if atr1m is None or (not self._is_finite(atr1m)) or atr1m <= 0:
+            return _not_ready("ATR1m no listo")
+
         atr5m = self.atr_values.get(sym)
         if atr5m is None or (not self._is_finite(atr5m)) or atr5m <= 0:
             return _not_ready("ATR5m no listo")
@@ -776,7 +780,7 @@ class TrendBot:
         def _slope(hist):
             if len(hist) <= SLOPE_LAG:
                 return math.nan
-            return (float(hist[-1]) - float(hist[-1 - SLOPE_LAG])) / atr5m
+            return (float(hist[-1]) - float(hist[-1 - SLOPE_LAG])) / atr1m
 
         def _curv(hist):
             if len(hist) <= (2 * CURV_LAG):
@@ -784,7 +788,7 @@ class TrendBot:
             t0 = float(hist[-1])
             t1 = float(hist[-1 - CURV_LAG])
             t2 = float(hist[-1 - 2 * CURV_LAG])
-            return (t0 - 2.0 * t1 + t2) / atr5m
+            return (t0 - 2.0 * t1 + t2) / atr1m
 
         slope_ema9 = _slope(e9_hist)
         slope_ema21 = _slope(e21_hist)
@@ -794,13 +798,13 @@ class TrendBot:
         curv_ema21 = _curv(e21_hist)
         curv_ema50 = _curv(e50_hist)
 
-        spread_9_21 = (ema9 - ema21) / atr5m
-        spread_21_50 = (ema21 - ema50) / atr5m
-        spread_9_50 = (ema9 - ema50) / atr5m
+        spread_9_21 = (ema9 - ema21) / atr1m
+        spread_21_50 = (ema21 - ema50) / atr1m
+        spread_9_50 = (ema9 - ema50) / atr1m
 
         # fan width / expansion
         fan_width = abs(ema9 - ema21) + abs(ema21 - ema50)
-        fan_width_atr = fan_width / atr5m if atr5m > 0 else math.nan
+        fan_width_atr = fan_width / atr1m if atr1m > 0 else math.nan
         self.fanw_hist[sym].append(float(fan_width_atr) if self._is_finite(fan_width_atr) else math.nan)
 
         if len(self.fanw_hist[sym]) > 3 and self._is_finite(self.fanw_hist[sym][-4]):
@@ -808,21 +812,21 @@ class TrendBot:
         else:
             fan_expansion = 0.0
 
-        dist_close_ema9 = (c - ema9) / atr5m
-        dist_close_ema21 = (c - ema21) / atr5m
-        dist_close_ema50 = (c - ema50) / atr5m
+        dist_close_ema9 = (c - ema9) / atr1m
+        dist_close_ema21 = (c - ema21) / atr1m
+        dist_close_ema50 = (c - ema50) / atr1m
 
         rng = h - l
         if rng <= 0:
             return _not_ready("range<=0")
         body = abs(c - o)
-        range_to_atr = rng / atr5m
-        body_to_atr = body / atr5m
+        range_to_atr = rng / atr1m
+        body_to_atr = body / atr1m
         body_frac = body / rng
 
         upper_wick = h - max(o, c)
         lower_wick = min(o, c) - l
-        wick_balance = (upper_wick - lower_wick) / atr5m
+        wick_balance = (upper_wick - lower_wick) / atr1m
 
         taker_buy_ratio = (buy / vol) if vol > 0 else 0.0
         taker_imbalance = ((2.0 * buy - vol) / vol) if vol > 0 else 0.0
