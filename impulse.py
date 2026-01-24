@@ -831,13 +831,18 @@ class TrendBot:
         if len(hist_struct) < max(TAKER_ROLL, 50):
             return _not_ready(f"struct_history corto ({len(hist_struct)})")
 
+        ti_hist = hist_struct[-TAKER_ROLL:]
+        if len(ti_hist) != TAKER_ROLL:
+            return _not_ready(f"taker_imbalance_20 corto ({len(ti_hist)})")
         ti_vals = []
-        for hh in hist_struct[-TAKER_ROLL:]:
+        for hh in ti_hist:
             vv = float(hh.get("volume", 0.0))
             bb = float(hh.get("taker_buy_base_volume", 0.0))
-            if vv > 0 and self._is_finite(vv) and self._is_finite(bb):
+            if self._is_finite(vv) and self._is_finite(bb) and vv > 0:
                 ti_vals.append((2.0 * bb - vv) / vv)
-        taker_imbalance_20 = (sum(ti_vals) / len(ti_vals)) if ti_vals else 0.0
+            else:
+                ti_vals.append(0.0)
+        taker_imbalance_20 = sum(ti_vals) / TAKER_ROLL
 
         # vol_z
         vol_series = []
