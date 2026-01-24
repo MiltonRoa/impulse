@@ -1390,16 +1390,17 @@ class TrendBot:
 
                 # Prefill fanw_hist (para fan_expansion)
                 self.fanw_hist[sym].clear()
-                atr5m_now = float(self.atr_values.get(sym, 0.0) or 0.0)
-                if atr5m_now > 0:
+                atr1m_now = float(self.atr_values_1m.get(sym, 0.0) or 0.0)
+                if atr1m_now > 0 and self._is_finite(atr1m_now):
                     start = max(0, len(closes1) - 200)
                     for i in range(start, len(closes1)):
                         e9  = float(ema9_series[i])
                         e21 = float(ema21_series[i])
                         e50 = float(ema50_series[i])
                         fw = abs(e9 - e21) + abs(e21 - e50)
-                        fwa = fw / atr5m_now
-                        self.fanw_hist[sym].append(float(fwa))
+                        fwa = fw / atr1m_now
+                        if self._is_finite(fwa):
+                            self.fanw_hist[sym].append(float(fwa))
 
                 # warmup: calcular snapshot una vez (para ver todo OK)
                 last_bar = self.struct_history_1m[sym][-1]
