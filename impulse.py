@@ -68,8 +68,8 @@ TRADE_COOLDOWN_SECONDS = 1800  # 30 min
 # ======================================================================
 # Estrategia TREND (modelos + thresholds)
 # ======================================================================
-MODEL_TREND_LONG_PATH = Path(__file__).with_name("model_trend_long.pkl")
-MODEL_TREND_SHORT_PATH = Path(__file__).with_name("model_trend_short.pkl")
+MODEL_TREND_LONG_PATH = Path(__file__).with_name("hit30_k2_v1_long.pkl")
+MODEL_TREND_SHORT_PATH = Path(__file__).with_name("hit30_k2_v1_short.pkl")
 
 # Umbrales (ajustalos)
 P_TREND_LONG_THRESHOLD = 0.79
@@ -82,32 +82,18 @@ SL_M_ATR5M = 1.5
 EMA_FAST = 9
 EMA_MID  = 21
 EMA_SLOW = 50
-SLOPE_LAG = 5
-CURV_LAG  = 5
-CLIP = 50.0
+EMA_SLOWER = 100
+EMA_SLOWEST = 200
 
-VOL_Z_WIN = 200
-ATR_Z_WIN = 500
-ATR_Z_MIN = 200
-TAKER_ROLL = 20
+SLOPE_LAGS = (3, 9, 21, 30)
+CURV_LAGS = (5, 15)
 
-# ----------------------------------------------------------------------
-# Fallback EXACTO de features (tus 29)
-# ----------------------------------------------------------------------
-FEATURES_FALLBACK_29 = [
-    "slope_ema9", "slope_ema21", "slope_ema50",
-    "curv_ema9", "curv_ema21", "curv_ema50",
-    "spread_9_21", "spread_21_50", "spread_9_50",
-    "fan_width_atr", "fan_expansion",
-    "dist_close_ema9", "dist_close_ema21", "dist_close_ema50",
-    "range_to_atr", "body_to_atr", "body_frac", "wick_balance",
-    "vol_z", "atr_z",
-    "taker_buy_ratio", "taker_imbalance", "taker_imbalance_20",
-    "dist_to_ema26_5m",
-    "ema_order_5m_long", "ema_order_5m_short",
-    "slope_ema21_5m", "slope_ema50_5m",
-    "dist_close_ema50_5m",
-]
+VOL_Z_WIN = 120
+VOL_Z_MIN = 60
+ATR_Z_WIN = 200
+ATR_Z_MIN = 100
+TAKER_ROLL_20 = 20
+TAKER_ROLL_30 = 30
 
 # ======================================================================
 # Utils
@@ -627,17 +613,21 @@ class TrendBot:
 
         # EMA 1m histories (para slope/curv)
         self.ema1m_hist = defaultdict(lambda: {
-            "ema9": deque(maxlen=200),
-            "ema21": deque(maxlen=200),
-            "ema50": deque(maxlen=200),
+            "ema9": deque(maxlen=500),
+            "ema21": deque(maxlen=500),
+            "ema50": deque(maxlen=500),
+            "ema100": deque(maxlen=500),
+            "ema200": deque(maxlen=500),
         })
 
-        # EMA 5m regime 9/21/50
+        # EMA 5m regime 9/21/50/100/200
         self.close5m_hist = defaultdict(lambda: deque(maxlen=INIT_CANDLES))
         self.ema5m_hist = defaultdict(lambda: {
             "ema9": deque(maxlen=500),
             "ema21": deque(maxlen=500),
             "ema50": deque(maxlen=500),
+            "ema100": deque(maxlen=500),
+            "ema200": deque(maxlen=500),
         })
 
         # struct history 1m
@@ -645,6 +635,9 @@ class TrendBot:
 
         # fan width hist (para fan_expansion)
         self.fanw_hist = defaultdict(lambda: deque(maxlen=200))
+
+        # atr5m causal por minuto
+        self.atr5m_causal_hist_1m = defaultdict(lambda: deque(maxlen=500))
 
         # filtros símbolo
         self.symbol_filters = {}
@@ -666,30 +659,20 @@ class TrendBot:
         self.calibrator_long = self.packed_long.get("calibrator") if isinstance(self.packed_long, dict) else None
         self.calibrator_short = self.packed_short.get("calibrator") if isinstance(self.packed_short, dict) else None
 
-        # features desde pkl
+        # features desde pkl (obligatorias)
         self.features_long = self.packed_long.get("features") if isinstance(self.packed_long, dict) else None
         self.features_short = self.packed_short.get("features") if isinstance(self.packed_short, dict) else None
 
-        # Lista final: si los dos existen y coinciden => usar esa
-        # si no, fallback a tus 29
-        feature_names = None
-        if isinstance(self.features_long, list) and isinstance(self.features_short, list):
-            if self.features_long == self.features_short and len(self.features_long) > 0:
-                feature_names = list(self.features_long)
-            elif len(self.features_long) > 0:
-                feature_names = list(self.features_long)
-            elif len(self.features_short) > 0:
-                feature_names = list(self.features_short)
+        if not isinstance(self.features_long, list) or not isinstance(self.features_short, list):
+            raise RuntimeError("[INIT][ERROR] El modelo no incluye 'features' en ambos .pkl.")
+        if self.features_long != self.features_short:
+            raise RuntimeError("[INIT][ERROR] Las features long/short no coinciden.")
+        if len(self.features_long) != 60:
+            raise RuntimeError(f"[INIT][ERROR] Se esperaban 60 features, recibidas {len(self.features_long)}.")
 
-        if not feature_names:
-            feature_names = list(FEATURES_FALLBACK_29)
-
-        # aseguramos 29 y orden estable
-        self.feature_names_ordered = list(feature_names)
+        self.feature_names_ordered = list(self.features_long)
 
         print(f"[INIT] Features activas ({len(self.feature_names_ordered)}): {self.feature_names_ordered}")
-        if len(self.feature_names_ordered) != 29:
-            print("[INIT][WARN] La lista de features no tiene 29. Revisá el .pkl (features) o el fallback.")
 
     # ---------------------------
     # Helpers
@@ -737,18 +720,14 @@ class TrendBot:
         return 0.0, 0.0
 
     # ---------------------------
-    # Features TREND (exact names del entrenamiento)
+    # Features HIT (exact names del entrenamiento)
     # ---------------------------
-    def _build_trend_features(self, sym, bar):
+    def _build_hit_features(self, sym, bar):
         """
         Devuelve: (feats:dict|None, reason:str|None)
         """
         def _not_ready(reason: str):
             return None, reason
-
-        atr1m = self.atr_values_1m.get(sym)
-        if atr1m is None or (not self._is_finite(atr1m)) or atr1m <= 0:
-            return _not_ready("ATR1m no listo")
 
         atr5m = self.atr_values.get(sym)
         if atr5m is None or (not self._is_finite(atr5m)) or atr5m <= 0:
@@ -764,171 +743,140 @@ class TrendBot:
             return _not_ready("OHLC/vol no finito")
 
         closes = list(self.closes_history.get(sym, []))
-        if len(closes) < (EMA_SLOW + 2 * CURV_LAG + 20):
+        if len(closes) < EMA_SLOWEST + 5:
             return _not_ready(f"closes_history corto ({len(closes)})")
 
-        e9_hist = self.ema1m_hist[sym]["ema9"]
-        e21_hist = self.ema1m_hist[sym]["ema21"]
-        e50_hist = self.ema1m_hist[sym]["ema50"]
-        if len(e50_hist) < (2 * CURV_LAG + 2):
-            return _not_ready(f"EMA1m hist corto ({len(e50_hist)})")
+        e1 = self.ema1m_hist[sym]
+        e9_hist = e1["ema9"]
+        e21_hist = e1["ema21"]
+        e50_hist = e1["ema50"]
+        e100_hist = e1["ema100"]
+        e200_hist = e1["ema200"]
+
+        needed_hist = max(max(SLOPE_LAGS), 2 * max(CURV_LAGS)) + 1
+        if len(e200_hist) < needed_hist:
+            return _not_ready(f"EMA1m hist corto ({len(e200_hist)})")
 
         ema9 = float(e9_hist[-1])
         ema21 = float(e21_hist[-1])
         ema50 = float(e50_hist[-1])
+        ema100 = float(e100_hist[-1])
+        ema200 = float(e200_hist[-1])
 
-        def _slope(hist):
-            if len(hist) <= SLOPE_LAG:
+        def _slope(hist, lag):
+            if len(hist) <= lag:
                 return math.nan
-            return (float(hist[-1]) - float(hist[-1 - SLOPE_LAG])) / atr1m
+            return (float(hist[-1]) - float(hist[-1 - lag])) / atr5m
 
-        def _curv(hist):
-            if len(hist) <= (2 * CURV_LAG):
+        def _curv(hist, lag):
+            if len(hist) <= (2 * lag):
                 return math.nan
             t0 = float(hist[-1])
-            t1 = float(hist[-1 - CURV_LAG])
-            t2 = float(hist[-1 - 2 * CURV_LAG])
-            return (t0 - 2.0 * t1 + t2) / atr1m
+            t1 = float(hist[-1 - lag])
+            t2 = float(hist[-1 - 2 * lag])
+            return (t0 - 2.0 * t1 + t2) / atr5m
 
-        slope_ema9 = _slope(e9_hist)
-        slope_ema21 = _slope(e21_hist)
-        slope_ema50 = _slope(e50_hist)
+        feats = {
+            "dist_close_ema9": (c - ema9) / atr5m,
+            "dist_close_ema21": (c - ema21) / atr5m,
+            "dist_close_ema50": (c - ema50) / atr5m,
+            "dist_close_ema100": (c - ema100) / atr5m,
+            "dist_close_ema200": (c - ema200) / atr5m,
+            "spread_9_21": (ema9 - ema21) / atr5m,
+            "spread_21_50": (ema21 - ema50) / atr5m,
+            "spread_50_100": (ema50 - ema100) / atr5m,
+            "spread_100_200": (ema100 - ema200) / atr5m,
+            "spread_9_200": (ema9 - ema200) / atr5m,
+        }
 
-        curv_ema9 = _curv(e9_hist)
-        curv_ema21 = _curv(e21_hist)
-        curv_ema50 = _curv(e50_hist)
+        for lag in SLOPE_LAGS:
+            feats[f"slope_ema21_lag{lag}"] = _slope(e21_hist, lag)
+            feats[f"slope_ema50_lag{lag}"] = _slope(e50_hist, lag)
+            feats[f"slope_ema200_lag{lag}"] = _slope(e200_hist, lag)
 
-        spread_9_21 = (ema9 - ema21) / atr1m
-        spread_21_50 = (ema21 - ema50) / atr1m
-        spread_9_50 = (ema9 - ema50) / atr1m
-
-        # fan width / expansion
-        fan_width = abs(ema9 - ema21) + abs(ema21 - ema50)
-        fan_width_atr = fan_width / atr1m if atr1m > 0 else math.nan
-        self.fanw_hist[sym].append(float(fan_width_atr) if self._is_finite(fan_width_atr) else math.nan)
-
-        if len(self.fanw_hist[sym]) > 3 and self._is_finite(self.fanw_hist[sym][-4]):
-            fan_expansion = float(self.fanw_hist[sym][-1] - self.fanw_hist[sym][-4])
-        else:
-            fan_expansion = 0.0
-
-        dist_close_ema9 = (c - ema9) / atr1m
-        dist_close_ema21 = (c - ema21) / atr1m
-        dist_close_ema50 = (c - ema50) / atr1m
+        for lag in CURV_LAGS:
+            feats[f"curv_ema21_lag{lag}"] = _curv(e21_hist, lag)
+            feats[f"curv_ema50_lag{lag}"] = _curv(e50_hist, lag)
 
         rng = h - l
         if rng <= 0:
             return _not_ready("range<=0")
         body = abs(c - o)
-        range_to_atr = rng / atr1m
-        body_to_atr = body / atr1m
-        body_frac = body / rng
+        feats["range_to_atr"] = rng / atr5m
+        feats["body_to_atr"] = body / atr5m
 
-        upper_wick = h - max(o, c)
-        lower_wick = min(o, c) - l
-        wick_balance = (upper_wick - lower_wick) / atr1m
+        fan_width = (
+            abs(ema9 - ema21)
+            + abs(ema21 - ema50)
+            + abs(ema50 - ema100)
+            + abs(ema100 - ema200)
+        )
+        fan_width_atr = fan_width / atr5m
+        if not self._is_finite(fan_width_atr):
+            return _not_ready("fan_width_atr no finito")
+        feats["fan_width_atr"] = fan_width_atr
 
-        taker_buy_ratio = (buy / vol) if vol > 0 else 0.0
+        self.fanw_hist[sym].append(float(fan_width_atr))
+        for lag in (3, 9, 21):
+            if len(self.fanw_hist[sym]) <= lag:
+                return _not_ready(f"fan_width hist corto ({len(self.fanw_hist[sym])})")
+            feats[f"fan_expansion_lag{lag}"] = fan_width_atr - float(self.fanw_hist[sym][-1 - lag])
+
         taker_imbalance = ((2.0 * buy - vol) / vol) if vol > 0 else 0.0
+        feats["taker_imbalance"] = taker_imbalance
 
         hist_struct = list(self.struct_history_1m.get(sym, []))
-        if len(hist_struct) < max(TAKER_ROLL, 50):
+        if len(hist_struct) < TAKER_ROLL_30:
             return _not_ready(f"struct_history corto ({len(hist_struct)})")
 
-        ti_hist = hist_struct[-TAKER_ROLL:]
-        if len(ti_hist) != TAKER_ROLL:
-            return _not_ready(f"taker_imbalance_20 corto ({len(ti_hist)})")
-        ti_vals = []
-        for hh in ti_hist:
-            vv = float(hh.get("volume", 0.0))
-            bb = float(hh.get("taker_buy_base_volume", 0.0))
-            if self._is_finite(vv) and self._is_finite(bb) and vv > 0:
-                ti_vals.append((2.0 * bb - vv) / vv)
-            else:
-                ti_vals.append(0.0)
-        taker_imbalance_20 = sum(ti_vals) / TAKER_ROLL
+        def _mean_imbalance(last_n):
+            values = []
+            for hh in hist_struct[-last_n:]:
+                vv = float(hh.get("volume", 0.0))
+                bb = float(hh.get("taker_buy_base_volume", 0.0))
+                if self._is_finite(vv) and self._is_finite(bb) and vv > 0:
+                    values.append((2.0 * bb - vv) / vv)
+                else:
+                    values.append(0.0)
+            return sum(values) / float(last_n)
 
-        # vol_z
+        feats["taker_imbalance_20"] = _mean_imbalance(TAKER_ROLL_20)
+        feats["taker_imbalance_30"] = _mean_imbalance(TAKER_ROLL_30)
+
         vol_series = []
         for hh in hist_struct[-VOL_Z_WIN:]:
             vv = float(hh.get("volume", 0.0))
             if self._is_finite(vv):
                 vol_series.append(vv)
-        vol_series.append(vol)
-        vol_z = self._zscore_last(vol_series, min_n=50)
+        if len(vol_series) < VOL_Z_MIN:
+            return _not_ready(f"vol_series corto ({len(vol_series)})")
+        feats["vol_z"] = self._zscore_last(vol_series, min_n=VOL_Z_MIN)
 
-        # atr_z
-        atr_hist = list(self.atr5m_history[sym])[-ATR_Z_WIN:] + [float(atr5m)]
-        atr_z = self._zscore_last(atr_hist, min_n=ATR_Z_MIN)
+        atr_hist = list(self.atr5m_causal_hist_1m[sym])[-ATR_Z_WIN:]
+        if len(atr_hist) < ATR_Z_MIN:
+            return _not_ready(f"atr_hist corto ({len(atr_hist)})")
+        feats["atr_z"] = self._zscore_last(atr_hist, min_n=ATR_Z_MIN)
 
-        ema26_5m = self.ema26_5m.get(sym)
-        dist_to_ema26_5m = ((c - float(ema26_5m)) / atr5m) if (ema26_5m is not None and self._is_finite(ema26_5m)) else 0.0
-
-        # régimen 5m
         e5 = self.ema5m_hist[sym]
-        if len(e5["ema50"]) >= 2 and len(e5["ema21"]) >= 2 and len(e5["ema9"]) >= 2:
-            ema9_5m = float(e5["ema9"][-1])
-            ema21_5m = float(e5["ema21"][-1])
-            ema50_5m = float(e5["ema50"][-1])
+        if len(e5["ema200"]) < 4:
+            return _not_ready(f"EMA5m hist corto ({len(e5['ema200'])})")
 
-            ema_order_5m_long = 1.0 if (ema9_5m > ema21_5m > ema50_5m) else 0.0
-            ema_order_5m_short = 1.0 if (ema9_5m < ema21_5m < ema50_5m) else 0.0
+        ema9_5m = float(e5["ema9"][-1])
+        ema21_5m = float(e5["ema21"][-1])
+        ema50_5m = float(e5["ema50"][-1])
+        ema100_5m = float(e5["ema100"][-1])
+        ema200_5m = float(e5["ema200"][-1])
 
-            slope_ema21_5m = (float(e5["ema21"][-1]) - float(e5["ema21"][-2])) / atr5m
-            slope_ema50_5m = (float(e5["ema50"][-1]) - float(e5["ema50"][-2])) / atr5m
-            dist_close_ema50_5m = (c - ema50_5m) / atr5m
-        else:
-            ema_order_5m_long = 0.0
-            ema_order_5m_short = 0.0
-            slope_ema21_5m = 0.0
-            slope_ema50_5m = 0.0
-            dist_close_ema50_5m = 0.0
-
-        def _clip(x, lo=-CLIP, hi=CLIP):
-            if x is None or (not self._is_finite(x)):
-                return 0.0
-            return max(lo, min(hi, float(x)))
-
-        feats = {
-            "slope_ema9": _clip(slope_ema9),
-            "slope_ema21": _clip(slope_ema21),
-            "slope_ema50": _clip(slope_ema50),
-
-            "curv_ema9": _clip(curv_ema9),
-            "curv_ema21": _clip(curv_ema21),
-            "curv_ema50": _clip(curv_ema50),
-
-            "spread_9_21": _clip(spread_9_21),
-            "spread_21_50": _clip(spread_21_50),
-            "spread_9_50": _clip(spread_9_50),
-
-            "fan_width_atr": _clip(fan_width_atr, lo=0, hi=CLIP),
-            "fan_expansion": _clip(fan_expansion),
-
-            "dist_close_ema9": _clip(dist_close_ema9),
-            "dist_close_ema21": _clip(dist_close_ema21),
-            "dist_close_ema50": _clip(dist_close_ema50),
-
-            "range_to_atr": _clip(range_to_atr, lo=0, hi=CLIP),
-            "body_to_atr": _clip(body_to_atr, lo=0, hi=CLIP),
-            "body_frac": _clip(body_frac, lo=0, hi=1.5),
-            "wick_balance": _clip(wick_balance),
-
-            "vol_z": _clip(vol_z, lo=-10, hi=10),
-            "atr_z": _clip(atr_z, lo=-10, hi=10),
-
-            "taker_buy_ratio": _clip(taker_buy_ratio, lo=-CLIP, hi=CLIP),
-            "taker_imbalance": _clip(taker_imbalance, lo=-CLIP, hi=CLIP),
-            "taker_imbalance_20": _clip(taker_imbalance_20, lo=-CLIP, hi=CLIP),
-
-            "dist_to_ema26_5m": _clip(dist_to_ema26_5m),
-
-            "ema_order_5m_long": float(ema_order_5m_long),
-            "ema_order_5m_short": float(ema_order_5m_short),
-            "slope_ema21_5m": _clip(slope_ema21_5m),
-            "slope_ema50_5m": _clip(slope_ema50_5m),
-            "dist_close_ema50_5m": _clip(dist_close_ema50_5m),
-        }
+        feats["ema_stack_5m_long"] = 1.0 if (ema9_5m > ema21_5m > ema50_5m > ema100_5m > ema200_5m) else 0.0
+        feats["ema_stack_5m_short"] = 1.0 if (ema9_5m < ema21_5m < ema50_5m < ema100_5m < ema200_5m) else 0.0
+        feats["dist_close_ema50_5m"] = (c - ema50_5m) / atr5m
+        feats["dist_close_ema200_5m"] = (c - ema200_5m) / atr5m
+        feats["spread_21_50_5m"] = (ema21_5m - ema50_5m) / atr5m
+        feats["spread_50_200_5m"] = (ema50_5m - ema200_5m) / atr5m
+        feats["slope_ema50_5m_1"] = (ema50_5m - float(e5["ema50"][-2])) / atr5m
+        feats["slope_ema50_5m_3"] = (ema50_5m - float(e5["ema50"][-4])) / atr5m
+        feats["slope_ema200_5m_1"] = (ema200_5m - float(e5["ema200"][-2])) / atr5m
+        feats["slope_ema200_5m_3"] = (ema200_5m - float(e5["ema200"][-4])) / atr5m
 
         # Validación estricta: TODAS las features del modelo deben existir y ser finitas
         for k in self.feature_names_ordered:
@@ -955,7 +903,7 @@ class TrendBot:
 
         trend_1m_long, trend_1m_short = self._calc_trend_1m_flags(sym)
 
-        feats, reason = self._build_trend_features(sym, bar)
+        feats, reason = self._build_hit_features(sym, bar)
         if feats is None:
             # snapshot con ceros para features + metas
             snapshot = {k: 0.0 for k in self.feature_names_ordered}
@@ -978,6 +926,25 @@ class TrendBot:
 
         # DataFrame EXACTO
         x_row = {f: float(feats[f]) for f in self.feature_names_ordered}
+        if not all(self._is_finite(v) for v in x_row.values()):
+            snapshot = dict(feats)
+            snapshot.update({
+                "trend_1m_long": float(trend_1m_long),
+                "trend_1m_short": float(trend_1m_short),
+                "_status": "not_ready",
+                "_reason": "features no finitas",
+                "p_long_raw": math.nan,
+                "p_long": math.nan,
+                "p_thr_long": float(P_TREND_LONG_THRESHOLD),
+                "p_short_raw": math.nan,
+                "p_short": math.nan,
+                "p_thr_short": float(P_TREND_SHORT_THRESHOLD),
+                "tp_k_atr5m": float(TP_K_ATR5M),
+                "sl_m_atr5m": float(SL_M_ATR5M),
+            })
+            self._last_debug.setdefault(sym, {})["ml_features"] = snapshot
+            return None
+
         x_df = pd.DataFrame([x_row], columns=self.feature_names_ordered)
 
         # ---------
@@ -1049,10 +1016,12 @@ class TrendBot:
             return None
 
         # gating de operación
-        # - solo LONG si trend_1m_long==1
-        # - solo SHORT si trend_1m_short==1
-        long_ready = (trend_1m_long == 1.0) and math.isfinite(p_long) and (p_long >= P_TREND_LONG_THRESHOLD)
-        short_ready = (trend_1m_short == 1.0) and math.isfinite(p_short) and (p_short >= P_TREND_SHORT_THRESHOLD)
+        # - solo LONG si ema_stack_5m_long==1
+        # - solo SHORT si ema_stack_5m_short==1
+        ema_stack_5m_long = float(feats.get("ema_stack_5m_long", 0.0))
+        ema_stack_5m_short = float(feats.get("ema_stack_5m_short", 0.0))
+        long_ready = (ema_stack_5m_long == 1.0) and math.isfinite(p_long) and (p_long >= P_TREND_LONG_THRESHOLD)
+        short_ready = (ema_stack_5m_short == 1.0) and math.isfinite(p_short) and (p_short >= P_TREND_SHORT_THRESHOLD)
 
         # bloqueo por cooldown / trade activo SOLO para operar
         last_ts = self.last_signal_time.get(sym, 0)
@@ -1253,17 +1222,22 @@ class TrendBot:
             self.ema1m_hist[s]["ema9"].clear()
             self.ema1m_hist[s]["ema21"].clear()
             self.ema1m_hist[s]["ema50"].clear()
+            self.ema1m_hist[s]["ema100"].clear()
+            self.ema1m_hist[s]["ema200"].clear()
             self.close5m_hist[s].clear()
             self.ema5m_hist[s]["ema9"].clear()
             self.ema5m_hist[s]["ema21"].clear()
             self.ema5m_hist[s]["ema50"].clear()
+            self.ema5m_hist[s]["ema100"].clear()
+            self.ema5m_hist[s]["ema200"].clear()
+            self.atr5m_causal_hist_1m[s].clear()
 
         valid_symbols = []
         for sym in list(self.symbols):
             try:
                 # 5m warmup
                 klines5 = await self.client.futures_klines(symbol=sym, interval="5m", limit=INIT_CANDLES)
-                if not klines5 or len(klines5) < max(60, ATR_PERIOD + 5):
+                if not klines5 or len(klines5) < max(EMA_SLOWEST + 5, ATR_PERIOD + 5):
                     raise RuntimeError(f"Warmup 5m insuficiente: {len(klines5) if klines5 else 0}")
 
                 closes5 = [float(c[4]) for c in klines5]
@@ -1278,17 +1252,23 @@ class TrendBot:
                         ema26 = p * (2/27) + ema26 * (1 - 2/27)
                 self.ema26_5m[sym] = ema26
 
-                # EMA 5m 9/21/50
+                # EMA 5m 9/21/50/100/200
                 self.close5m_hist[sym].extend(closes5[-INIT_CANDLES:])
                 ema9_5  = self._init_ema_from_prices(closes5, EMA_FAST)
                 ema21_5 = self._init_ema_from_prices(closes5, EMA_MID)
                 ema50_5 = self._init_ema_from_prices(closes5, EMA_SLOW)
+                ema100_5 = self._init_ema_from_prices(closes5, EMA_SLOWER)
+                ema200_5 = self._init_ema_from_prices(closes5, EMA_SLOWEST)
                 for v in ema9_5[-INIT_CANDLES:]:
                     self.ema5m_hist[sym]["ema9"].append(float(v))
                 for v in ema21_5[-INIT_CANDLES:]:
                     self.ema5m_hist[sym]["ema21"].append(float(v))
                 for v in ema50_5[-INIT_CANDLES:]:
                     self.ema5m_hist[sym]["ema50"].append(float(v))
+                for v in ema100_5[-INIT_CANDLES:]:
+                    self.ema5m_hist[sym]["ema100"].append(float(v))
+                for v in ema200_5[-INIT_CANDLES:]:
+                    self.ema5m_hist[sym]["ema200"].append(float(v))
 
                 # ATR Wilder 5m + history
                 trs5 = []
@@ -1325,7 +1305,8 @@ class TrendBot:
 
                 # 1m warmup
                 klines1 = await self.client.futures_klines(symbol=sym, interval="1m", limit=INIT_CANDLES)
-                if not klines1 or len(klines1) < max(EMA_SLOW + 2*CURV_LAG + 5, VOL_Z_WIN + 5, ATR_PERIOD + 5):
+                min_1m = max(EMA_SLOWEST + 2 * max(CURV_LAGS) + 5, VOL_Z_WIN + 5, ATR_Z_WIN + 5, TAKER_ROLL_30 + 5)
+                if not klines1 or len(klines1) < min_1m:
                     raise RuntimeError(f"Warmup 1m insuficiente: {len(klines1) if klines1 else 0}")
 
                 self.closes_history[sym].clear()
@@ -1376,10 +1357,12 @@ class TrendBot:
                 self.atr_values_1m[sym] = atr1m_last
                 self.prev_close_1m[sym] = float(prev_close1m) if prev_close1m is not None else None
 
-                # EMA 1m 9/21/50 init
+                # EMA 1m 9/21/50/100/200 init
                 ema9_series  = self._init_ema_from_prices(closes1, EMA_FAST)
                 ema21_series = self._init_ema_from_prices(closes1, EMA_MID)
                 ema50_series = self._init_ema_from_prices(closes1, EMA_SLOW)
+                ema100_series = self._init_ema_from_prices(closes1, EMA_SLOWER)
+                ema200_series = self._init_ema_from_prices(closes1, EMA_SLOWEST)
 
                 for v in ema9_series[-INIT_CANDLES:]:
                     self.ema1m_hist[sym]["ema9"].append(float(v))
@@ -1387,20 +1370,36 @@ class TrendBot:
                     self.ema1m_hist[sym]["ema21"].append(float(v))
                 for v in ema50_series[-INIT_CANDLES:]:
                     self.ema1m_hist[sym]["ema50"].append(float(v))
+                for v in ema100_series[-INIT_CANDLES:]:
+                    self.ema1m_hist[sym]["ema100"].append(float(v))
+                for v in ema200_series[-INIT_CANDLES:]:
+                    self.ema1m_hist[sym]["ema200"].append(float(v))
 
                 # Prefill fanw_hist (para fan_expansion)
                 self.fanw_hist[sym].clear()
-                atr1m_now = float(self.atr_values_1m.get(sym, 0.0) or 0.0)
-                if atr1m_now > 0 and self._is_finite(atr1m_now):
+                atr5m_now = float(self.atr_values.get(sym, 0.0) or 0.0)
+                if atr5m_now > 0 and self._is_finite(atr5m_now):
                     start = max(0, len(closes1) - 200)
                     for i in range(start, len(closes1)):
                         e9  = float(ema9_series[i])
                         e21 = float(ema21_series[i])
                         e50 = float(ema50_series[i])
-                        fw = abs(e9 - e21) + abs(e21 - e50)
-                        fwa = fw / atr1m_now
+                        e100 = float(ema100_series[i])
+                        e200 = float(ema200_series[i])
+                        fw = (
+                            abs(e9 - e21)
+                            + abs(e21 - e50)
+                            + abs(e50 - e100)
+                            + abs(e100 - e200)
+                        )
+                        fwa = fw / atr5m_now
                         if self._is_finite(fwa):
                             self.fanw_hist[sym].append(float(fwa))
+
+                # Prefill atr5m causal per 1m
+                self.atr5m_causal_hist_1m[sym].clear()
+                for _ in range(len(closes1)):
+                    self.atr5m_causal_hist_1m[sym].append(float(atr5m_last))
 
                 # warmup: calcular snapshot una vez (para ver todo OK)
                 last_bar = self.struct_history_1m[sym][-1]
@@ -1451,9 +1450,13 @@ class TrendBot:
         prev9 = self.ema1m_hist[sym]["ema9"][-1] if self.ema1m_hist[sym]["ema9"] else None
         prev21 = self.ema1m_hist[sym]["ema21"][-1] if self.ema1m_hist[sym]["ema21"] else None
         prev50 = self.ema1m_hist[sym]["ema50"][-1] if self.ema1m_hist[sym]["ema50"] else None
+        prev100 = self.ema1m_hist[sym]["ema100"][-1] if self.ema1m_hist[sym]["ema100"] else None
+        prev200 = self.ema1m_hist[sym]["ema200"][-1] if self.ema1m_hist[sym]["ema200"] else None
         self.ema1m_hist[sym]["ema9"].append(self._ema_next(prev9, close_price, EMA_FAST))
         self.ema1m_hist[sym]["ema21"].append(self._ema_next(prev21, close_price, EMA_MID))
         self.ema1m_hist[sym]["ema50"].append(self._ema_next(prev50, close_price, EMA_SLOW))
+        self.ema1m_hist[sym]["ema100"].append(self._ema_next(prev100, close_price, EMA_SLOWER))
+        self.ema1m_hist[sym]["ema200"].append(self._ema_next(prev200, close_price, EMA_SLOWEST))
 
         # ATR1m update
         prev_close1m = self.prev_close_1m.get(sym)
@@ -1465,6 +1468,10 @@ class TrendBot:
         prev_atr1m = self.atr_values_1m.get(sym)
         self.atr_values_1m[sym] = wilder_atr_update(prev_atr1m, tr, ATR_PERIOD) if prev_atr1m else float(tr)
         self.prev_close_1m[sym] = close_price
+
+        atr5m_causal = float(self.atr_values.get(sym, 0.0) or 0.0)
+        if self._is_finite(atr5m_causal) and atr5m_causal > 0:
+            self.atr5m_causal_hist_1m[sym].append(float(atr5m_causal))
 
         bar_payload = {
             "open": open_val,
@@ -1518,16 +1525,20 @@ class TrendBot:
         ema26_new = close_5m if prev26 is None else close_5m * (2/27) + prev26 * (1 - 2/27)
         self.ema26_5m[sym] = ema26_new
 
-        # EMA 5m 9/21/50 update
+        # EMA 5m 9/21/50/100/200 update
         self.close5m_hist[sym].append(close_5m)
 
         p9 = self.ema5m_hist[sym]["ema9"][-1] if self.ema5m_hist[sym]["ema9"] else None
         p21 = self.ema5m_hist[sym]["ema21"][-1] if self.ema5m_hist[sym]["ema21"] else None
         p50 = self.ema5m_hist[sym]["ema50"][-1] if self.ema5m_hist[sym]["ema50"] else None
+        p100 = self.ema5m_hist[sym]["ema100"][-1] if self.ema5m_hist[sym]["ema100"] else None
+        p200 = self.ema5m_hist[sym]["ema200"][-1] if self.ema5m_hist[sym]["ema200"] else None
 
         self.ema5m_hist[sym]["ema9"].append(self._ema_next(p9, close_5m, EMA_FAST))
         self.ema5m_hist[sym]["ema21"].append(self._ema_next(p21, close_5m, EMA_MID))
         self.ema5m_hist[sym]["ema50"].append(self._ema_next(p50, close_5m, EMA_SLOW))
+        self.ema5m_hist[sym]["ema100"].append(self._ema_next(p100, close_5m, EMA_SLOWER))
+        self.ema5m_hist[sym]["ema200"].append(self._ema_next(p200, close_5m, EMA_SLOWEST))
 
         # TR
         prev_close = self.prev_close_5m.get(sym)
