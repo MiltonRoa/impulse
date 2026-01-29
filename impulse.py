@@ -974,23 +974,8 @@ class TrendBot:
                 logger.exception("Error predict_proba trend short", exc_info=exc)
                 errors.append("predict_proba short")
 
-        if self.calibrator_long is not None and math.isfinite(p_long_raw):
-            try:
-                p_long = float(self.calibrator_long.predict(np.array([p_long_raw]))[0])
-            except Exception as exc:
-                logger.exception("Error calibrator trend long", exc_info=exc)
-                errors.append("calibrator long")
-        else:
-            p_long = p_long_raw
-
-        if self.calibrator_short is not None and math.isfinite(p_short_raw):
-            try:
-                p_short = float(self.calibrator_short.predict(np.array([p_short_raw]))[0])
-            except Exception as exc:
-                logger.exception("Error calibrator trend short", exc_info=exc)
-                errors.append("calibrator short")
-        else:
-            p_short = p_short_raw
+        p_long = p_long_raw
+        p_short = p_short_raw
 
         status = "ok" if not errors else "warn"
         reason2 = ", ".join(errors) if errors else ""
