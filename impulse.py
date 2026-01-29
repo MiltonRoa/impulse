@@ -777,6 +777,13 @@ class TrendBot:
             return (t0 - 2.0 * t1 + t2) / atr5m
 
         feats = {
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "volume": vol,
+            "taker_buy_base_volume": buy,
+            "atr5m": atr5m,
             "dist_close_ema9": (c - ema9) / atr5m,
             "dist_close_ema21": (c - ema21) / atr5m,
             "dist_close_ema50": (c - ema50) / atr5m,
@@ -863,10 +870,17 @@ class TrendBot:
 
         ema9_5m = float(e5["ema9"][-1])
         ema21_5m = float(e5["ema21"][-1])
+        ema26_5m = float(self.ema26_5m.get(sym, math.nan))
         ema50_5m = float(e5["ema50"][-1])
         ema100_5m = float(e5["ema100"][-1])
         ema200_5m = float(e5["ema200"][-1])
 
+        feats["ema9_5m"] = ema9_5m
+        feats["ema21_5m"] = ema21_5m
+        feats["ema26_5m"] = ema26_5m
+        feats["ema50_5m"] = ema50_5m
+        feats["ema100_5m"] = ema100_5m
+        feats["ema200_5m"] = ema200_5m
         feats["ema_stack_5m_long"] = 1.0 if (ema9_5m > ema21_5m > ema50_5m > ema100_5m > ema200_5m) else 0.0
         feats["ema_stack_5m_short"] = 1.0 if (ema9_5m < ema21_5m < ema50_5m < ema100_5m < ema200_5m) else 0.0
         feats["dist_close_ema50_5m"] = (c - ema50_5m) / atr5m
