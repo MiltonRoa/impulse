@@ -1271,11 +1271,8 @@ class TrendBot:
                 lows5 = [float(c[3]) for c in klines5]
 
                 # EMA26 5m
-                ema26 = None
-                if len(closes5) >= 26:
-                    ema26 = sum(closes5[:26]) / 26.0
-                    for p in closes5[26:]:
-                        ema26 = p * (2/27) + ema26 * (1 - 2/27)
+                ema26_series = self._init_ema_from_prices(closes5, 26)
+                ema26 = ema26_series[-1] if ema26_series else None
                 self.ema26_5m[sym] = ema26
 
                 # EMA 5m 9/21/50/100/200
@@ -1548,7 +1545,7 @@ class TrendBot:
 
         # EMA26 5m
         prev26 = self.ema26_5m.get(sym)
-        ema26_new = close_5m if prev26 is None else close_5m * (2/27) + prev26 * (1 - 2/27)
+        ema26_new = self._ema_next(prev26, close_5m, 26)
         self.ema26_5m[sym] = ema26_new
 
         # EMA 5m 9/21/50/100/200 update
