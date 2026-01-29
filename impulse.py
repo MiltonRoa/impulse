@@ -94,6 +94,7 @@ ATR_Z_WIN = 200
 ATR_Z_MIN = 100
 TAKER_ROLL_20 = 20
 TAKER_ROLL_30 = 30
+CLIP = 50.0
 
 # ======================================================================
 # Utils
@@ -893,6 +894,30 @@ class TrendBot:
         feats["slope_ema50_5m_3"] = (ema50_5m - float(e5["ema50"][-4])) / atr5m
         feats["slope_ema200_5m_1"] = (ema200_5m - float(e5["ema200"][-2])) / atr5m
         feats["slope_ema200_5m_3"] = (ema200_5m - float(e5["ema200"][-4])) / atr5m
+
+        def _clip_value(value: float, low: float, high: float) -> float:
+            if not self._is_finite(value):
+                return value
+            return min(max(value, low), high)
+
+        symmetric_prefixes = (
+            "dist_close_ema",
+            "spread_",
+            "slope_",
+            "curv_",
+            "fan_expansion_lag",
+        )
+        for key, value in list(feats.items()):
+            if key.startswith(symmetric_prefixes):
+                feats[key] = _clip_value(float(value), -CLIP, CLIP)
+
+        for key in ("range_to_atr", "body_to_atr", "fan_width_atr"):
+            if key in feats:
+                feats[key] = _clip_value(float(feats[key]), 0.0, CLIP)
+
+        for key in ("vol_z", "atr_z"):
+            if key in feats:
+                feats[key] = _clip_value(float(feats[key]), -10.0, 10.0)
 
         # Validación estricta: TODAS las features del modelo deben existir y ser finitas
         for k in self.feature_names_ordered:
