@@ -1319,6 +1319,23 @@ class TrendBot:
                     atr5m_last = float(sum(trs5)/len(trs5)) if trs5 else 0.0
                     self.atr5m_history[sym].append(atr5m_last)
 
+                atr5m_series_5m = []
+                if trs5:
+                    cur_series = None
+                    if len(trs5) >= ATR_PERIOD:
+                        for idx, tr in enumerate(trs5):
+                            if idx < ATR_PERIOD - 1:
+                                cur_series = sum(trs5[:idx + 1]) / float(idx + 1)
+                            elif idx == ATR_PERIOD - 1:
+                                cur_series = sum(trs5[:ATR_PERIOD]) / ATR_PERIOD
+                            else:
+                                cur_series = wilder_atr_update(cur_series, tr, ATR_PERIOD)
+                            atr5m_series_5m.append(float(cur_series))
+                    else:
+                        for idx in range(len(trs5)):
+                            cur_series = sum(trs5[:idx + 1]) / float(idx + 1)
+                            atr5m_series_5m.append(float(cur_series))
+
                 self.atr_values[sym] = atr5m_last
                 self.prev_close_5m[sym] = float(closes5[-1])
 
@@ -1419,10 +1436,23 @@ class TrendBot:
                         if self._is_finite(fwa):
                             self.fanw_hist[sym].append(float(fwa))
 
-                # Prefill atr5m causal per 1m
+                # Prefill atr5m causal per 1m usando histórico ATR5m alineado al tiempo
                 self.atr5m_causal_hist_1m[sym].clear()
-                for _ in range(len(closes1)):
-                    self.atr5m_causal_hist_1m[sym].append(float(atr5m_last))
+                atr5m_by_open_time = {}
+                for candle5, atr_val in zip(klines5, atr5m_series_5m):
+                    if candle5 and len(candle5) > 0:
+                        atr5m_by_open_time[int(candle5[0])] = float(atr_val)
+
+                earliest_atr = atr5m_series_5m[0] if atr5m_series_5m else atr5m_last
+                last_atr = None
+                for candle1 in klines1:
+                    open_time_1m = int(candle1[0])
+                    open_time_5m = open_time_1m - (open_time_1m % (5 * 60 * 1000))
+                    atr_val = atr5m_by_open_time.get(open_time_5m)
+                    if atr_val is None:
+                        atr_val = last_atr if last_atr is not None else earliest_atr
+                    last_atr = atr_val
+                    self.atr5m_causal_hist_1m[sym].append(float(atr_val))
 
                 # warmup: calcular snapshot una vez (para ver todo OK)
                 last_bar = self.struct_history_1m[sym][-1]
