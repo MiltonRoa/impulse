@@ -776,6 +776,7 @@ class TrendBot:
             t2 = float(hist[-1 - 2 * lag])
             return (t0 - 2.0 * t1 + t2) / atr5m
 
+        # Features crudas del minuto actual (sin normalización)
         feats = {
             "open": o,
             "high": h,
@@ -875,6 +876,7 @@ class TrendBot:
         ema100_5m = float(e5["ema100"][-1])
         ema200_5m = float(e5["ema200"][-1])
 
+        # EMAs 5m crudas ya calculadas por el bot (sin recálculo)
         feats["ema9_5m"] = ema9_5m
         feats["ema21_5m"] = ema21_5m
         feats["ema26_5m"] = ema26_5m
