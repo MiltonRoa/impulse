@@ -11,6 +11,7 @@ import asyncio
 import json
 import time
 import math
+import random
 from decimal import Decimal
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -64,6 +65,7 @@ ATR_PERIOD = 14
 ATR5M_HISTORY_MAXLEN = 1000
 ORDER_CHECK_INTERVAL = 1
 TRADE_COOLDOWN_SECONDS = 2700  # 45 min
+DEBUG_SYMBOLS_PER_MINUTE = 5
 
 # ======================================================================
 # Estrategia TREND (modelos + thresholds)
@@ -648,6 +650,13 @@ class TrendBot:
 
         # debug
         self._last_debug = {}
+        self._debug_symbols = set()
+        self._debug_minute = None
+        self._summary_minute = None
+        self._summary_counts = None
+        self.last_5m_close_time = {}
+        self._last_stale_warning_minute = {}
+        self._stack5m_state = {}
 
         # cargar modelos trend
         self.packed_long = _load_trained_model(MODEL_TREND_LONG_PATH)
@@ -1175,6 +1184,66 @@ class TrendBot:
         else:
             print(now_str, f"[ML-FEATURES] {sym} | sin snapshot")
 
+    def _select_debug_symbols(self):
+        if not self.symbols:
+            self._debug_symbols = set()
+            return
+        sample_size = min(DEBUG_SYMBOLS_PER_MINUTE, len(self.symbols))
+        self._debug_symbols = set(random.sample(self.symbols, sample_size))
+
+    def _reset_summary_counts(self):
+        self._summary_counts = {
+            "seen": 0,
+            "status_ok": 0,
+            "status_not_ready": 0,
+            "status_warn": 0,
+            "ema_stack_long": 0,
+            "ema_stack_short": 0,
+            "ema_stack_mixed": 0,
+        }
+
+    def _count_stale_symbols(self, now_ms: int) -> int:
+        stale = 0
+        for sym in self.symbols:
+            last_close = self.last_5m_close_time.get(sym)
+            if not last_close:
+                continue
+            if now_ms - int(last_close) > 10 * 60 * 1000:
+                stale += 1
+        return stale
+
+    def _print_summary(self, now_ms: int):
+        if not self._summary_counts:
+            return
+        now_dt = datetime.fromtimestamp(now_ms / 1000, tz=LOCAL_TZ)
+        stale_count = self._count_stale_symbols(now_ms)
+        summary = self._summary_counts
+        line = (
+            f"{now_dt.strftime('%H:%M:%S')} [SUMMARY_1m] "
+            f"seen={summary['seen']} "
+            f"status_ok={summary['status_ok']} status_not_ready={summary['status_not_ready']} "
+            f"status_warn={summary['status_warn']} "
+            f"stack_long={summary['ema_stack_long']} stack_short={summary['ema_stack_short']} "
+            f"stack_mixed={summary['ema_stack_mixed']} "
+            f"stale5m={stale_count}"
+        )
+        print(line)
+
+    def _roll_minute(self, close_time_ms: int):
+        minute = close_time_ms // 60000
+        if self._summary_minute is None:
+            self._summary_minute = minute
+            self._debug_minute = minute
+            self._reset_summary_counts()
+            self._select_debug_symbols()
+            return
+        if minute != self._summary_minute:
+            self._print_summary(close_time_ms)
+            self._summary_minute = minute
+            self._debug_minute = minute
+            self._reset_summary_counts()
+            self._select_debug_symbols()
+
     # ---------------------------
     # Cache filtros
     # ---------------------------
@@ -1257,6 +1326,9 @@ class TrendBot:
             self.ema5m_hist[s]["ema100"].clear()
             self.ema5m_hist[s]["ema200"].clear()
             self.atr5m_causal_hist_1m[s].clear()
+            self.last_5m_close_time[s] = None
+            self._last_stale_warning_minute[s] = None
+            self._stack5m_state[s] = None
 
         valid_symbols = []
         for sym in list(self.symbols):
@@ -1338,6 +1410,8 @@ class TrendBot:
 
                 self.atr_values[sym] = atr5m_last
                 self.prev_close_5m[sym] = float(closes5[-1])
+                if klines5 and len(klines5[-1]) > 6:
+                    self.last_5m_close_time[sym] = int(klines5[-1][6])
 
                 self.atr5m_tr_buffer[sym].clear()
                 for tr in trs5[-ATR_PERIOD:]:
@@ -1488,6 +1562,8 @@ class TrendBot:
         taker_buy_volume = float(bar.get("taker_buy_base_volume", 0))
         close_time = int(bar.get("close_time") or 0)
         open_time_local = bar.get("open_time_local")
+        if close_time:
+            self._roll_minute(close_time)
 
         self.closes_history.setdefault(sym, deque(maxlen=INIT_CANDLES)).append(close_price)
         self.high_history.setdefault(sym, deque(maxlen=INIT_CANDLES)).append(high_val)
@@ -1541,8 +1617,47 @@ class TrendBot:
         # siempre calcula y guarda snapshot con p_long y p_short
         signal = self.get_ml_signal_for_latest_bar(sym, bar_payload, is_warmup=False)
 
-        # DEBUG (imprime todo)
-        self._debug_state(sym)
+        # resumen por símbolo
+        if self._summary_counts is not None:
+            self._summary_counts["seen"] += 1
+            last_debug = self._last_debug.get(sym, {}) if isinstance(self._last_debug, dict) else {}
+            ml_features = last_debug.get("ml_features") if isinstance(last_debug, dict) else None
+            status = ml_features.get("_status") if isinstance(ml_features, dict) else None
+            if status == "ok":
+                self._summary_counts["status_ok"] += 1
+            elif status == "warn":
+                self._summary_counts["status_warn"] += 1
+            else:
+                self._summary_counts["status_not_ready"] += 1
+
+            ema_stack_long = 0
+            ema_stack_short = 0
+            if isinstance(ml_features, dict):
+                ema_stack_long = 1 if float(ml_features.get("ema_stack_5m_long", 0.0)) == 1.0 else 0
+                ema_stack_short = 1 if float(ml_features.get("ema_stack_5m_short", 0.0)) == 1.0 else 0
+            if ema_stack_long:
+                self._summary_counts["ema_stack_long"] += 1
+            elif ema_stack_short:
+                self._summary_counts["ema_stack_short"] += 1
+            else:
+                self._summary_counts["ema_stack_mixed"] += 1
+
+        # warnings de stale 5m
+        last_5m_close = self.last_5m_close_time.get(sym)
+        if last_5m_close:
+            age_ms = close_time - int(last_5m_close)
+            if age_ms > 10 * 60 * 1000:
+                minute_key = close_time // 60000
+                last_warn_minute = self._last_stale_warning_minute.get(sym)
+                if last_warn_minute != minute_key:
+                    self._last_stale_warning_minute[sym] = minute_key
+                    age_min = age_ms / 60000.0
+                    now_str = datetime.fromtimestamp(close_time / 1000, tz=LOCAL_TZ).strftime("%H:%M:%S")
+                    print(now_str, f"[WARN] 5m stale {sym} age_min={age_min:.1f}")
+
+        # DEBUG (imprime todo solo para algunos)
+        if sym in self._debug_symbols:
+            self._debug_state(sym)
 
         if signal and signal.get("side", "").upper() in ("LONG", "SHORT") and signal.get("atr5m", 0) > 0:
             now_ts = time.time()
@@ -1572,6 +1687,9 @@ class TrendBot:
         close_5m = float(bar.get("close", 0))
         high_5m = float(bar.get("high", 0))
         low_5m = float(bar.get("low", 0))
+        close_time = int(bar.get("close_time") or 0)
+        if close_time:
+            self.last_5m_close_time[sym] = close_time
 
         # EMA26 5m
         prev26 = self.ema26_5m.get(sym)
@@ -1617,8 +1735,33 @@ class TrendBot:
 
         self.atr5m_history[sym].append(float(atr))
 
-        print(datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
-              f"[DEBUG_5m] {sym} Close:{close_5m:.6f} ATR5:{atr:.6f} EMA26_5m:{ema26_new:.6f}")
+        ema9_5m = float(self.ema5m_hist[sym]["ema9"][-1]) if self.ema5m_hist[sym]["ema9"] else math.nan
+        ema21_5m = float(self.ema5m_hist[sym]["ema21"][-1]) if self.ema5m_hist[sym]["ema21"] else math.nan
+        ema50_5m = float(self.ema5m_hist[sym]["ema50"][-1]) if self.ema5m_hist[sym]["ema50"] else math.nan
+        ema100_5m = float(self.ema5m_hist[sym]["ema100"][-1]) if self.ema5m_hist[sym]["ema100"] else math.nan
+        ema200_5m = float(self.ema5m_hist[sym]["ema200"][-1]) if self.ema5m_hist[sym]["ema200"] else math.nan
+
+        if ema9_5m > ema21_5m > ema50_5m > ema100_5m > ema200_5m:
+            stack_state = "LONG"
+        elif ema9_5m < ema21_5m < ema50_5m < ema100_5m < ema200_5m:
+            stack_state = "SHORT"
+        else:
+            stack_state = "MIXED"
+
+        if self._stack5m_state.get(sym) != stack_state:
+            self._stack5m_state[sym] = stack_state
+            now_str = datetime.now(LOCAL_TZ).strftime("%H:%M:%S")
+            print(
+                now_str,
+                "[STACK5M]",
+                sym,
+                stack_state,
+                f"ema9={_fmt6(ema9_5m)}",
+                f"ema21={_fmt6(ema21_5m)}",
+                f"ema50={_fmt6(ema50_5m)}",
+                f"ema100={_fmt6(ema100_5m)}",
+                f"ema200={_fmt6(ema200_5m)}",
+            )
 
     # ---------------------------
     # Periodic refilter
