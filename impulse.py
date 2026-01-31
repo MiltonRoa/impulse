@@ -63,7 +63,7 @@ INIT_CANDLES = 500
 ATR_PERIOD = 14
 ATR5M_HISTORY_MAXLEN = 1000
 ORDER_CHECK_INTERVAL = 1
-TRADE_COOLDOWN_SECONDS = 1800  # 30 min
+TRADE_COOLDOWN_SECONDS = 2700  # 45 min
 
 # ======================================================================
 # Estrategia TREND (modelos + thresholds)
