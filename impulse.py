@@ -1050,13 +1050,9 @@ class TrendBot:
         if is_warmup:
             return None
 
-        # gating de operación
-        # - solo LONG si ema_stack_5m_long==1
-        # - solo SHORT si ema_stack_5m_short==1
-        ema_stack_5m_long = float(feats.get("ema_stack_5m_long", 0.0))
-        ema_stack_5m_short = float(feats.get("ema_stack_5m_short", 0.0))
-        long_ready = (ema_stack_5m_long == 1.0) and math.isfinite(p_long) and (p_long >= P_TREND_LONG_THRESHOLD)
-        short_ready = (ema_stack_5m_short == 1.0) and math.isfinite(p_short) and (p_short >= P_TREND_SHORT_THRESHOLD)
+        # gating de operación (solo por probabilidad del modelo)
+        long_ready = math.isfinite(p_long) and (p_long >= P_TREND_LONG_THRESHOLD)
+        short_ready = math.isfinite(p_short) and (p_short >= P_TREND_SHORT_THRESHOLD)
 
         # bloqueo por cooldown / trade activo SOLO para operar
         last_ts = self.last_signal_time.get(sym, 0)
