@@ -76,6 +76,7 @@ MODEL_TREND_SHORT_PATH = Path(__file__).with_name("hit30_k2_v1_short.pkl")
 # Umbrales (ajustalos)
 P_TREND_LONG_THRESHOLD = 0.79
 P_TREND_SHORT_THRESHOLD = 0.74
+RANGE_TO_ATR_MAX = 3.3
 
 TP_K_ATR5M = 2.2
 SL_M_ATR5M = 1.5
@@ -1053,6 +1054,8 @@ class TrendBot:
         # gating de operación (solo por probabilidad del modelo)
         long_ready = math.isfinite(p_long) and (p_long >= P_TREND_LONG_THRESHOLD)
         short_ready = math.isfinite(p_short) and (p_short >= P_TREND_SHORT_THRESHOLD)
+        range_to_atr = float(feats.get("range_to_atr", math.nan))
+        range_to_atr_ok = math.isfinite(range_to_atr) and range_to_atr < RANGE_TO_ATR_MAX
 
         # bloqueo por cooldown / trade activo SOLO para operar
         last_ts = self.last_signal_time.get(sym, 0)
@@ -1062,6 +1065,8 @@ class TrendBot:
             return None
 
         if not long_ready and not short_ready:
+            return None
+        if not range_to_atr_ok:
             return None
 
         entry_price = float(bar.get("close", 0.0))
