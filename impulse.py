@@ -67,6 +67,8 @@ ORDER_CHECK_INTERVAL = 1
 TRADE_COOLDOWN_SECONDS = 2700  # 45 min
 DEBUG_SYMBOLS_PER_MINUTE = 5
 
+time_offset_ms = 0
+
 # ======================================================================
 # Estrategia TREND (modelos + thresholds)
 # ======================================================================
@@ -126,6 +128,43 @@ def wilder_atr_update(prev_atr, tr: float, period: int) -> float:
     if prev is None or (isinstance(prev, float) and (math.isnan(prev) or prev <= 0)):
         return float(tr)
     return float(prev) + (float(tr) - float(prev)) / float(period)
+
+
+def get_timestamp_ms() -> int:
+    return int(time.time() * 1000) + time_offset_ms
+
+
+async def resync_time_offset(client) -> int:
+    global time_offset_ms
+    server_time_data = await client.futures_time()
+    server_time = int(server_time_data.get("serverTime", 0))
+    local_time_ms = int(time.time() * 1000)
+    time_offset_ms = server_time - local_time_ms
+    return time_offset_ms
+
+
+def _is_timestamp_error_1021(exc: Exception) -> bool:
+    if isinstance(exc, BinanceAPIException):
+        try:
+            return int(getattr(exc, "code", 0)) == -1021
+        except Exception:
+            pass
+    msg = str(exc)
+    return "-1021" in msg
+
+
+async def request_futures_api_with_retry(client, method, path, *, signed=False, data=None):
+    payload = dict(data or {})
+    try:
+        return await client._request_futures_api(method, path, signed=signed, data=payload)
+    except Exception as exc:
+        if not _is_timestamp_error_1021(exc):
+            raise
+        await resync_time_offset(client)
+        retry_payload = dict(payload)
+        if "timestamp" in retry_payload:
+            retry_payload["timestamp"] = get_timestamp_ms()
+        return await client._request_futures_api(method, path, signed=signed, data=retry_payload)
 
 # ======================================================================
 # Telegram
@@ -316,7 +355,8 @@ async def futures_create_algo_conditional(
         "type": order_type,
         "triggerPrice": str(trigger_price),
         "workingType": "MARK_PRICE",
-        "timestamp": int(time.time() * 1000),
+        "timestamp": get_timestamp_ms(),
+        "recvWindow": 10000,
     }
     if client_algo_id is not None:
         params["clientAlgoId"] = client_algo_id
@@ -331,7 +371,13 @@ async def futures_create_algo_conditional(
     elif quantity is not None:
         params["quantity"] = str(quantity)
 
-    resp = await client._request_futures_api("post", "algoOrder", signed=True, data=params)
+    resp = await request_futures_api_with_retry(
+        client,
+        "post",
+        "algoOrder",
+        signed=True,
+        data=params,
+    )
     algo_id = resp.get("algoId") if isinstance(resp, dict) else None
     return resp, algo_id
 
@@ -1120,9 +1166,12 @@ class TrendBot:
 
             if position_amt == 0:
                 try:
-                    await self.client._request_futures_api(
-                        "delete", "algoOpenOrders", signed=True,
-                        data={"symbol": sym, "timestamp": int(time.time() * 1000)},
+                    await request_futures_api_with_retry(
+                        self.client,
+                        "delete",
+                        "algoOpenOrders",
+                        signed=True,
+                        data={"symbol": sym, "timestamp": get_timestamp_ms(), "recvWindow": 10000},
                     )
                     print(datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
                           f"[INFO] Algo orders canceladas para {sym}")
@@ -1845,6 +1894,7 @@ class TrendBot:
             return
 
         self.client = await AsyncClient.create(self.api_key, self.api_secret)
+        await resync_time_offset(self.client)
 
         await self._cache_symbol_filters()
 
