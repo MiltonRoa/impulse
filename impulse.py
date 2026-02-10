@@ -533,9 +533,11 @@ async def place_futures_order_async(
             quantity_num = qty2
             quantity = f"{quantity_num:.{precision_qty}f}"
 
-    async def _real_tp_quantity():
+    async def _real_position_data():
         delays = [0, 0.2, 0.4, 0.6]
         position_amt = 0.0
+        position_amt_signed = 0.0
+        entry_price_real = None
         for delay in delays:
             if delay:
                 await asyncio.sleep(delay)
@@ -553,23 +555,76 @@ async def place_futures_order_async(
                 continue
 
             try:
-                position_amt = abs(float(entry_pos.get("positionAmt", 0)))
+                position_amt_signed = float(entry_pos.get("positionAmt", 0))
+                position_amt = abs(position_amt_signed)
             except (TypeError, ValueError):
                 position_amt = 0.0
+                position_amt_signed = 0.0
+
+            try:
+                entry_price_real_candidate = float(entry_pos.get("entryPrice", 0))
+                if entry_price_real_candidate > 0:
+                    entry_price_real = entry_price_real_candidate
+            except (TypeError, ValueError):
+                entry_price_real = None
 
             if position_amt > 0:
                 break
 
         tp_qty_num = math.floor(position_amt / step_size) * step_size
         if tp_qty_num < min_qty:
-            return None
-        tp_qty_str = f"{tp_qty_num:.{precision_qty}f}"
-        if float(tp_qty_str) <= 0:
-            return None
-        return tp_qty_str
+            tp_qty_str = None
+        else:
+            tp_qty_str = f"{tp_qty_num:.{precision_qty}f}"
+            if float(tp_qty_str) <= 0:
+                tp_qty_str = None
+
+        return {
+            "tp_quantity": tp_qty_str,
+            "entry_real": entry_price_real,
+            "position_amt": position_amt,
+            "position_amt_signed": position_amt_signed,
+        }
+
+    side_order = Client.SIDE_BUY if signal == "long" else Client.SIDE_SELL
+    try:
+        await client.futures_create_order(symbol=sym, side=side_order, type="MARKET", quantity=quantity)
+        print(datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
+              "– MERCADO:", signal.upper(), sym, ", qty=", quantity)
+        position_data = await _real_position_data()
+    except BinanceAPIException as e:
+        print(datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
+              "– ERROR ORDEN MARKET (", sym, "):", e)
+        await _send_telegram_message(f"⚠️ No se pudo abrir posición {signal.upper()} {sym}\nError MARKET: {e}")
+        return False
+    except Exception as e:
+        print(datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
+              "– ERROR GENÉRICO MARKET (", sym, "):", e)
+        await _send_telegram_message(f"⚠️ No se pudo abrir posición {signal.upper()} {sym}\nExcepción: {e}")
+        return False
+
+    tp_quantity = position_data.get("tp_quantity")
+    entry_real = position_data.get("entry_real")
+    position_amt = float(position_data.get("position_amt", 0.0) or 0.0)
+
+    if not entry_real or position_amt <= 0:
+        logger.error("No se pudo obtener entry/posición real para %s tras MARKET", sym)
+        return False
+
+    atr_for_orders = float(atr_5m or 0.0)
+    if atr_for_orders <= 0:
+        logger.error("ATR5m inválido para recalcular SL/TP real en %s", sym)
+        return False
+
+    if signal == "long":
+        tp1 = entry_real + TP_K_ATR5M * atr_for_orders
+        sl = entry_real - SL_M_ATR5M * atr_for_orders
+    else:
+        tp1 = entry_real - TP_K_ATR5M * atr_for_orders
+        sl = entry_real + SL_M_ATR5M * atr_for_orders
 
     # separación mínima por tick
-    entry_rounded = float(f"{entry:.{precision_price}f}")
+    entry_rounded = float(f"{entry_real:.{precision_price}f}")
     min_offset = tick_size
     if signal == "long":
         if entry_rounded - sl < min_offset:
@@ -585,23 +640,6 @@ async def place_futures_order_async(
     sl_price = f"{sl:.{precision_price}f}"
     tp1_price = f"{tp1:.{precision_price}f}"
 
-    side_order = Client.SIDE_BUY if signal == "long" else Client.SIDE_SELL
-    try:
-        await client.futures_create_order(symbol=sym, side=side_order, type="MARKET", quantity=quantity)
-        print(datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
-              "– MERCADO:", signal.upper(), sym, ", qty=", quantity)
-        tp_quantity = await _real_tp_quantity()
-    except BinanceAPIException as e:
-        print(datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
-              "– ERROR ORDEN MARKET (", sym, "):", e)
-        await _send_telegram_message(f"⚠️ No se pudo abrir posición {signal.upper()} {sym}\nError MARKET: {e}")
-        return False
-    except Exception as e:
-        print(datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
-              "– ERROR GENÉRICO MARKET (", sym, "):", e)
-        await _send_telegram_message(f"⚠️ No se pudo abrir posición {signal.upper()} {sym}\nExcepción: {e}")
-        return False
-
     opposite = Client.SIDE_SELL if signal == "long" else Client.SIDE_BUY
 
     try:
@@ -612,9 +650,22 @@ async def place_futures_order_async(
             "close_side": opposite,
             "stop_algo_id": stop_algo_id,
             "tp_algo_id": tp_algo_id,
-            "entry_price": float(f"{entry:.{precision_price}f}"),
+            "entry_price": float(f"{entry_real:.{precision_price}f}"),
             "precision_price": precision_price,
         }
+
+        qty_real_msg = tp_quantity if tp_quantity is not None else f"{position_amt:.{precision_qty}f}"
+        slippage_abs = entry_real - float(entry)
+        slippage_pct = (slippage_abs / float(entry) * 100.0) if float(entry) else 0.0
+        real_msg = (
+            f"✅ POSICIÓN ABIERTA {signal.upper()} {sym}\n"
+            f"entry_real: {entry_real:.{precision_price}f}\n"
+            f"tp_real: {tp1_price}\n"
+            f"sl_real: {sl_price}\n"
+            f"qty_real: {qty_real_msg}\n"
+            f"slippage vs entry estimado: {slippage_abs:+.{precision_price}f} ({slippage_pct:+.4f}%)"
+        )
+        await _send_telegram_message(real_msg)
     except Exception as e:
         print(datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
               "– ERROR al crear SL/TP (ALGO) (", sym, "):", e)
