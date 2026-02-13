@@ -1145,6 +1145,18 @@ class TrendBot:
         # gating de operación (solo por probabilidad del modelo)
         long_ready = math.isfinite(p_long) and (p_long >= P_TREND_LONG_THRESHOLD)
         short_ready = math.isfinite(p_short) and (p_short >= P_TREND_SHORT_THRESHOLD)
+        long_beats_short_raw = (
+            math.isfinite(p_long_raw)
+            and math.isfinite(p_short_raw)
+            and (p_long_raw > p_short_raw)
+        )
+        short_beats_long_raw = (
+            math.isfinite(p_short_raw)
+            and math.isfinite(p_long_raw)
+            and (p_short_raw > p_long_raw)
+        )
+        long_signal = long_ready and long_beats_short_raw
+        short_signal = short_ready and short_beats_long_raw
         range_to_atr = float(feats.get("range_to_atr", math.nan))
         range_to_atr_ok = math.isfinite(range_to_atr) and range_to_atr < RANGE_TO_ATR_MAX
 
@@ -1155,7 +1167,7 @@ class TrendBot:
         if sym in self.active_trades:
             return None
 
-        if not long_ready and not short_ready:
+        if not long_signal and not short_signal:
             return None
         if not range_to_atr_ok:
             return None
@@ -1165,8 +1177,7 @@ class TrendBot:
         if atr5m <= 0:
             return None
 
-        # si ambos listos, elegir mayor prob
-        if long_ready and (not short_ready or p_long >= p_short):
+        if long_signal:
             tp_price = entry_price + TP_K_ATR5M * atr5m
             sl_price = entry_price - SL_M_ATR5M * atr5m
             side = "LONG"
